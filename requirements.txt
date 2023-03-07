@@ -1,0 +1,4 @@
+selenium
+redis
+selenium-wire
+requests
