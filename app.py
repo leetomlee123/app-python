@@ -1,7 +1,7 @@
 import hashlib
 import logging
 import os
-
+from aligo import Aligo
 import pymongo as pymongo
 import requests
 from flask import Flask, request, jsonify
@@ -10,7 +10,10 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from seleniumwire import webdriver
 from selenium.webdriver.chrome.options import Options as ChromeOption
-from selenium.webdriver import EdgeOptions
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
+executor = ThreadPoolExecutor()
+import json
 # 要执行的命令
 command = "ps -ef|grep -v grep|grep chrome|awk '{print $2}'|xargs kill -9"
 host='127.0.0.1'
@@ -18,17 +21,15 @@ host='127.0.0.1'
 # 执行命令
 
 
-# 要执行的命令
-command = "ps -ef|grep -v grep|grep chrome|awk '{print $2}'|xargs kill -9"
-
 # 执行命令
 
 md5 = hashlib.md5()
 app = Flask(__name__)
 import redis
-
+ali = Aligo()
 # 获取redis数据库连接
-r = redis.StrictRedis(host=host, port=6379, db=1, password='zx222lx')
+pool = redis.ConnectionPool(host=host, port=6379, decode_responses=True, db=1, password='zx222lx')
+r = redis.Redis(connection_pool=pool)
 myclient = pymongo.MongoClient(
     'mongodb://lx:Lx123456@%s:27017/' % host, connect=False)
 mydb = myclient["book"]
@@ -43,8 +44,32 @@ def get_proxy():
 def delete_proxy(proxy):
     print('delete proxy %s' % proxy)
     requests.get("http://%s:5010/delete/?proxy={}" % host.format(proxy))
+def run(params):
+    try:
+        a = urlparse(params['bookSrc'])
+        file_name = os.path.basename(a.path)
+        _, file_suffix = os.path.splitext(file_name)
 
+        # path = "d://%s_%s%s" % (params['bookName'], params['title'], file_suffix)
+        path = "/usr/tmp/%s_%s%s" % (params['bookName'], params['title'], file_suffix)
+        file = ali.get_file_by_path(path)
+        if file:
+            return
+        r = requests.get(params['bookSrc'], stream=True)
 
+        with open(r"%s" % path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=512):
+                f.write(chunk)
+        remote_folder = ali.get_folder_by_path('voice/%s' % params['bookName'])
+        if not remote_folder:
+            ali.create_folder(params['bookName'], ali.get_folder_by_path("voice").file_id)
+            remote_folder = ali.get_folder_by_path('voice/%s' % params['bookName'])
+
+        ali.upload_file(path, parent_file_id=remote_folder.file_id)
+    except Exception as e:
+        print(e)
+    finally:
+        os.remove(path)
 def getResorce(url):
     try:
         output = os.system(command)
@@ -83,16 +108,15 @@ def getResorce(url):
         if bookSrc is None:
             delete_proxy(proxy)
             return bookSrc
-        try:
-            voiceDB.insert_one({
-                "title": content,
-                "bookName": bookName,
-                "bookDesc": bookDesc,
-                "bookSrc": bookSrc
-            })
-        except Exception as e:
-            pass
-            # print(e)
+
+
+        executor.submit(run,{
+            "title": content,
+            "bookName": bookName,
+            "bookDesc": bookDesc,
+            "bookSrc": bookSrc
+        })
+
         return bookSrc
 
     except Exception as e:
@@ -113,7 +137,7 @@ def retryGetResource(url):
 
 @app.route('/')
 def hello_world():  # put application's code here
-    return 'Hello World!'
+    return 'Hello World'
 
 
 @app.route('/url', methods=["POST"])
@@ -127,15 +151,15 @@ def hello_world1():  # put application's code here
     if r.exists(md51):
         value = r.get(md51)
         return jsonify({"code": 200, "message": "获取资源成功", "data": value.decode('utf-8')})
-
-    resorce = retryGetResource(url)
-    if resorce:
-        r.set(md51, resorce)
-        return jsonify({"code": 200, "message": "获取资源成功", "data": resorce})
-    else:
-        return jsonify({"code": 404, "message": "bad request ", "data": ""})
+    with r.lock("lock", blocking_timeout=10):
+        resorce = retryGetResource(url)
+        if resorce:
+            r.set(md51, resorce,ex=60*10)
+            return jsonify({"code": 200, "message": "获取资源成功", "data": resorce})
+        else:
+            return jsonify({"code": 404, "message": "bad request ", "data": ""})
 
 
 if __name__ == '__main__':
     app.config['JSON_AS_ASCII'] = False
-    app.run(host="0.0.0.0", port=8899, debug=True)
+    app.run(host="0.0.0.0", port=8899, debug=False)
